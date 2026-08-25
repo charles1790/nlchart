@@ -2,6 +2,7 @@
 
 import os
 import sys
+import tempfile
 from datetime import datetime, timezone
 from typing import List
 
@@ -41,7 +42,7 @@ from qgis.core import (  # noqa: E402
     QgsDistanceArea,
 )
 from qgis.PyQt.QtCore import Qt
-from qgis.PyQt.QtGui import QColor
+from qgis.PyQt.QtGui import QColor, QImage
 
 from .basemaps import BASEMAPS, BasemapSpec
 from .geo_math import (
@@ -505,6 +506,87 @@ def _bbox_center_and_scale(
     return cx, cy, scale
 
 
+# The blank-tile export bug documented above (_SCALE_BOUNDS) turned out to
+# be broader than "close to a padded floor": rendering the exact same
+# scale/DPI at different real-world locations found the actual failure
+# threshold varies by *where* the chart is, not just how zoomed in it is --
+# e.g. sectional at 1:226,208 renders fine over Anchorage but blank over
+# Pittsburgh, and Pittsburgh only clears at roughly 1:350,000+. A single
+# static per-type floor can't account for this since it depends on
+# region-specific tile/service behavior, not a documented scale limit. So
+# instead of trying to widen _SCALE_BOUNDS further (which would just be
+# guessing at another number that might still fail somewhere else),
+# render_chart detects an actual blank result and steps the scale back
+# until it clears, at the exact location being rendered.
+#
+# Verified this detection method itself: a *direct in-memory* render
+# (QgsMapRendererParallelJob) does NOT reproduce the bug at all (matching
+# the original diagnosis that it's specific to the print-layout export
+# path) -- but a full QgsLayoutExporter image export at a small page size
+# reproduces the identical blank/clean pattern as a full production-size
+# page at the same scale/DPI, so a small export is a fast, faithful proxy
+# for "will the real export be blank here."
+_BLANK_CHECK_PAGE_MM = (60.0, 45.0)
+_BLANK_CHECK_SAMPLE_STRIDE = 37  # prime stride -- avoids aliasing with any regular pixel pattern
+_BLANK_CHECK_VARIANCE_THRESHOLD = 5
+_BLANK_SCALE_STEP_FACTOR = 1.4
+_BLANK_SCALE_MAX_RETRIES = 8
+
+
+def _is_blank_render(layer: QgsRasterLayer, cx: float, cy: float, scale: float, dpi: float) -> bool:
+    width_mm, height_mm = _BLANK_CHECK_PAGE_MM
+    extent = _rect_for_projected_center_and_scale(cx, cy, scale, width_mm, height_mm)
+
+    layout = QgsPrintLayout(QgsProject.instance())
+    layout.initializeDefaults()
+    page = layout.pageCollection().pages()[0]
+    page.setPageSize(QgsLayoutSize(width_mm, height_mm, QgsUnitTypes.LayoutMillimeters))
+
+    map_item = QgsLayoutItemMap(layout)
+    layout.addLayoutItem(map_item)
+    map_item.attemptMove(QgsLayoutPoint(0, 0, QgsUnitTypes.LayoutMillimeters))
+    map_item.attemptResize(QgsLayoutSize(width_mm, height_mm, QgsUnitTypes.LayoutMillimeters))
+    map_item.setLayers([layer])
+    map_item.setCrs(layer.crs())
+    map_item.zoomToExtent(extent)
+
+    fd, out_path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    os.remove(out_path)  # exportToImage errors on an existing file (GDAL PNG driver quirk)
+    try:
+        exporter = QgsLayoutExporter(layout)
+        settings = QgsLayoutExporter.ImageExportSettings()
+        settings.dpi = dpi
+        exporter.exportToImage(out_path, settings)
+        image = QImage(out_path)
+        buf = image.bits().asstring(image.sizeInBytes())
+    finally:
+        if os.path.exists(out_path):
+            os.remove(out_path)
+
+    sample = buf[::_BLANK_CHECK_SAMPLE_STRIDE]
+    return (max(sample) - min(sample)) < _BLANK_CHECK_VARIANCE_THRESHOLD
+
+
+def _avoid_blank_render(chart_type: str, layer: QgsRasterLayer, cx: float, cy: float, scale: float) -> float:
+    dpi = _EXPORT_DPI_BY_TYPE.get(chart_type, 300.0)
+    _, ceiling = _SCALE_BOUNDS.get(chart_type, (None, None))
+
+    for _ in range(_BLANK_SCALE_MAX_RETRIES):
+        if not _is_blank_render(layer, cx, cy, scale, dpi):
+            return scale
+        if ceiling is not None and scale >= ceiling:
+            break
+        scale = min(scale * _BLANK_SCALE_STEP_FACTOR, ceiling) if ceiling is not None else scale * _BLANK_SCALE_STEP_FACTOR
+
+    print(
+        f"warning: {chart_type} chart renders blank at this location for every scale tried, "
+        f"up to 1:{scale:,.0f} -- showing the widest scale tried anyway",
+        file=sys.stderr,
+    )
+    return scale
+
+
 def _clamp_scale(chart_type: str, requested_scale: float):
     """Returns (scale_to_use, warning_message_or_None)."""
     bounds = _SCALE_BOUNDS.get(chart_type)
@@ -589,6 +671,7 @@ def _resolve_extent(
     scale, warning = _clamp_scale(chart_spec.chart_type, requested_scale)
     if warning:
         print(f"warning: {warning}", file=sys.stderr)
+    scale = _avoid_blank_render(chart_spec.chart_type, layer, cx, cy, scale)
     return _rect_for_projected_center_and_scale(cx, cy, scale, frame_width_mm, frame_height_mm)
 
 

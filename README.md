@@ -285,6 +285,32 @@ still blanks out above roughly 170-180 DPI at its floor -- FAA's real
 max-detail edge (~1:144k) sits too close to the padded floor (1:175k) for
 that headroom to exist, so it stays capped at 150 DPI.
 
+**`_SCALE_BOUNDS` alone isn't sufficient**, though -- a real user report
+("sectional 10 SM around Pittsburgh" came back all-white) traced to the
+same export-path bug happening well *inside* the sectional bounds, at a
+scale (1:226k) that renders fine over other cities. Rendering the identical
+scale/DPI at several US cities found the actual failure threshold is
+location-dependent, not just distance-from-a-documented-edge: Pittsburgh
+and Columbus, OH both blank out up to roughly 1:300k-350k before clearing,
+while Philadelphia, Cleveland, and Anchorage are clean all the way down to
+the 1:175k floor. A single static per-type floor can't capture that, since
+it depends on region-specific tile/service behavior nobody can predict in
+advance. So `render.py` (`_avoid_blank_render`) now detects this directly:
+before the real export, it renders a small (60mm x 45mm) throwaway preview
+at the chosen scale and the type's real export DPI, and checks whether the
+result is uniform (near-zero pixel variance -- a genuine bug, not just
+sparse content, since the raw ArcGIS tile at that exact location was
+confirmed to have real chart data). If blank, it steps the scale out
+(x1.4 per try, up to 8 tries, capped at the type's `_SCALE_BOUNDS` ceiling)
+and rechecks, so a request quietly gets a wider, real chart instead of a
+blank page. This was verified to actually catch the bug reliably: a
+*direct in-memory* render (`QgsMapRendererParallelJob`) does **not**
+reproduce it at all (confirming, again, that it's specific to the
+print-layout export path, not the tile data), but a small `exportToImage`
+preview reproduces the exact same blank/clean pattern as a full
+production-size page at the same scale/DPI -- so it's a fast, faithful
+proxy rather than a guess.
+
 ## Web frontend
 
 A minimal web MVP sits in front of the same CLI pipeline -- no separate

@@ -7,10 +7,12 @@ drawn. Named-place coordinates are resolved by a real geocoder (see
 geocode.py), not the model's memorized training data.
 """
 
+from typing import List, Optional, Tuple
+
 import anthropic
 
 from ..geocode import resolve_area, resolve_line, resolve_point, resolve_polygon, resolve_range_rings
-from ..spec import ChartSpec, LLMChartRequest, PointSetSpec
+from ..spec import ChartSpec, LabeledPoint, LLMChartRequest, PointSetSpec
 from .base import ParseError
 
 _MODEL = "claude-sonnet-5"
@@ -184,15 +186,32 @@ lines/polygons/range_rings at their defaults.
 """
 
 
+_FILE_ADDENDUM = """
+
+A separate file of labeled points has been attached to this request. Its \
+coordinates are NOT in the text below -- they've already been parsed \
+directly from the file, not by you. If the request describes how to style \
+those points (a color, an icon), extract exactly one `point_sets` entry \
+with that color/icon and an empty `points` list -- the real points get \
+filled in downstream. If the request says nothing about styling them, \
+leave `point_sets` empty entirely; a default is applied downstream. Do NOT \
+invent any points/coordinates of your own for this request; every \
+`point_sets` entry you produce must have an empty `points` list.
+"""
+
+
 class ClaudeParser:
     def __init__(self) -> None:
         self._client = anthropic.Anthropic()
 
-    def parse(self, text: str) -> ChartSpec:
+    def parse(
+        self, text: str, uploaded_points: Optional[List[Tuple[str, float, float]]] = None
+    ) -> ChartSpec:
+        system = _SYSTEM_PROMPT + (_FILE_ADDENDUM if uploaded_points else "")
         response = self._client.messages.parse(
             model=_MODEL,
             max_tokens=1024,
-            system=_SYSTEM_PROMPT,
+            system=system,
             messages=[{"role": "user", "content": text}],
             output_format=LLMChartRequest,
         )
@@ -217,6 +236,22 @@ class ClaudeParser:
             )
             for ps in parsed.point_sets
         ]
+
+        if uploaded_points is not None:
+            # The model was told not to invent coordinates for this request
+            # (see _FILE_ADDENDUM) -- at most it named a color/icon via one
+            # empty-points entry. Use that styling (or the same defaults
+            # PointSetSpec/LLMPointSetSpec use elsewhere) and drop whatever
+            # it produced in favor of the real, file-parsed points.
+            color = point_sets[0].color if point_sets else "red"
+            icon = point_sets[0].icon if point_sets else "dot"
+            point_sets = [
+                PointSetSpec(
+                    color=color,
+                    icon=icon,
+                    points=[LabeledPoint(label=label, lat=lat, lon=lon) for label, lat, lon in uploaded_points],
+                )
+            ]
 
         lines = [resolve_line(ls) for ls in parsed.lines]
         polygons = [resolve_polygon(ps) for ps in parsed.polygons]

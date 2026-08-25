@@ -13,6 +13,8 @@ exists only to keep random internet bots from spending this box's
 Anthropic API budget on a public page.
 """
 
+import base64
+import binascii
 import hmac
 import json
 import os
@@ -24,11 +26,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from nlchart.geocode import GeocodeError
 from nlchart.parsing.base import ParseError
 from nlchart.parsing.claude import ClaudeParser
+from nlchart.points_file import PointsFileError, parse_points_file
 from nlchart.render import ChartRenderError, render_chart
 
 _PASSWORD = os.environ["NLCHART_WEB_PASSWORD"]
 _PORT = int(os.environ.get("NLCHART_WEB_PORT", "8877"))
-_MAX_BODY_BYTES = 20_000
+# Raised from the original 20,000 to fit a base64-encoded points file
+# (~1.33x the raw file size) alongside the request text; still bounded --
+# a point list has no legitimate reason to approach this.
+_MAX_BODY_BYTES = 5_000_000
 
 _render_lock = threading.Lock()
 _parser = ClaudeParser()
@@ -72,10 +78,25 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "enter a request describing the chart you want"})
             return
 
+        points_filename = payload.get("points_filename")
+        points_file_b64 = payload.get("points_file_base64")
+        uploaded_points = None
+        if points_filename and points_file_b64:
+            try:
+                content = base64.b64decode(points_file_b64, validate=True)
+            except (binascii.Error, ValueError):
+                self._send_json(400, {"error": "malformed points file upload"})
+                return
+            try:
+                uploaded_points = parse_points_file(points_filename, content)
+            except PointsFileError as exc:
+                self._send_json(422, {"error": str(exc)})
+                return
+
         output_path = None
         try:
             with _render_lock:
-                chart_spec = _parser.parse(text)
+                chart_spec = _parser.parse(text, uploaded_points=uploaded_points)
                 fd, output_path = tempfile.mkstemp(suffix=".pdf")
                 os.close(fd)
                 render_chart(chart_spec, output_path)

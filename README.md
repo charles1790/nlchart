@@ -290,14 +290,14 @@ that headroom to exist, so it stays capped at 150 DPI.
 A minimal web MVP sits in front of the same CLI pipeline -- no separate
 code path, no separate parsing/rendering logic:
 
-- **`webserver.py`** (repo root): a stdlib-only HTTP server (no new
-  dependencies) wrapping `nlchart` directly. `POST /generate` checks a
-  shared password (`hmac.compare_digest`, timing-safe), parses the request
-  through the same `ClaudeParser`/`render_chart` pipeline the CLI uses, and
-  streams the resulting PDF back. A single global lock serializes
-  parse+render calls -- `QgsProject` is a process-wide singleton
-  (`project.clear()`/`project.addMapLayer()` in `render.py`), so two
-  renders running at once would corrupt each other's state.
+- **`webserver.py`** (repo root): a stdlib-only HTTP server wrapping
+  `nlchart` directly. `POST /generate` checks a shared password
+  (`hmac.compare_digest`, timing-safe), parses the request through the same
+  `ClaudeParser`/`render_chart` pipeline the CLI uses, and streams the
+  resulting PDF back. A single global lock serializes parse+render calls --
+  `QgsProject` is a process-wide singleton (`project.clear()`/
+  `project.addMapLayer()` in `render.py`), so two renders running at once
+  would corrupt each other's state.
 - Runs as a persistent `systemd --user` service (`nlchart-web`, unit at
   `~/.config/systemd/user/nlchart-web.service`), restart-on-failure,
   survives reboot. Secrets (`ANTHROPIC_API_KEY`, the shared password) live
@@ -308,12 +308,49 @@ code path, no separate parsing/rendering logic:
   falls through to the static site's `file_server`.
 - **Frontend**: a plain HTML page (`/data/homepage/public/maps/index.html`
   in the homepage's own repo, outside this one) -- a textarea for the NL
-  request, a password field, and a submit button that POSTs JSON and
-  triggers a browser download of the returned PDF blob, or shows the
-  error text inline on a non-200 response.
+  request, an optional point-list file upload (see below), a password
+  field, and a submit button that POSTs JSON and triggers a browser
+  download of the returned PDF blob, or shows the error text inline on a
+  non-200 response.
 - The password exists only to keep random internet bots from spending this
   box's Anthropic API budget on a public page -- it is not real user auth,
   and there's no rate limiting beyond that single shared secret.
+
+## Point list uploads
+
+Pasting a list of points as freeform text into the NL request works for a
+handful of points, but has two real problems: the LLM's structured output
+for a parse call is capped at a fixed token budget (`max_tokens=1024`), so
+a long enough pasted list truncates mid-JSON and the request fails outright
+(empirically, past ~14-15 labeled points); and text copied out of a
+multi-column PDF often loses its row/column structure on paste, so even a
+short list isn't guaranteed to survive intact.
+
+A real file sidesteps both problems, so `point_sets` coordinates can
+instead come from an uploaded CSV/TSV/`.xlsx` file, parsed entirely in
+plain Python (`nlchart/points_file.py`) -- never round-tripped through the
+LLM at all, so there's no token ceiling and no copy/paste ambiguity:
+
+- Column detection looks for a header row (`label`/`name`/`site`/... for
+  the label; `lat`/`latitude`/`y`; `lon`/`lng`/`longitude`/`x`), and falls
+  back to plain positional `label, lat, lon` columns if no recognizable
+  header is found. A missing label column gets synthetic `Point N` labels.
+- The accompanying NL request still controls everything else -- chart
+  type, area, title, and how to style this point set (color/icon, e.g.
+  "mark them with blue boat icons"). The model is explicitly told not to
+  invent any coordinates of its own when a file is attached (see
+  `_FILE_ADDENDUM` in `nlchart/parsing/claude.py`); only the style, if any,
+  comes from its output.
+- CLI: `python3 -m nlchart.cli "..." --points-file sites.csv`.
+- Web: the file is read client-side as base64 and sent alongside `text` in
+  the same JSON POST (`points_filename` / `points_file_base64`) -- kept as
+  JSON rather than real `multipart/form-data` since Python's stdlib
+  `cgi` module (the only stdlib multipart parser) was removed in 3.13, and
+  a base64 field needs no new server-side dependency. `_MAX_BODY_BYTES` in
+  `webserver.py` is sized for this (5,000,000 bytes, up from the original
+  20,000 text-only cap).
+- `.xlsx` parsing needs `openpyxl` (`pip install --user openpyxl`); CSV/TSV
+  needs nothing beyond the stdlib `csv` module.
 
 ## Tests
 
@@ -338,6 +375,12 @@ measurement via `QgsDistanceArea`, layout construction, etc.) -- those are
 still verified by direct `ChartSpec` construction + visual inspection of
 the rendered PDF, as documented throughout this README, not by an
 automated suite.
+
+`tests/test_points_file.py` covers `nlchart/points_file.py` the same way --
+also no QGIS/network dependency, and it's the layer parsing whatever file a
+user uploads, so its column-detection heuristics and error cases (missing
+columns, non-numeric or out-of-range coordinates, unreadable content) are
+worth locking in too.
 
 ## Roadmap
 
@@ -376,4 +419,6 @@ automated suite.
   `requests` ships with this environment already).
 - `ANTHROPIC_API_KEY` set in the environment (or an `ant auth login`
   profile).
+- `openpyxl` (`pip install --user openpyxl`) -- only needed for `.xlsx`
+  point-list uploads; CSV/TSV uploads use nothing beyond the stdlib.
 - `pytest` (`pip install --user pytest`) -- dev-only, for `tests/`.

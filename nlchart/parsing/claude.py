@@ -10,6 +10,7 @@ geocode.py), not the model's memorized training data.
 from typing import List, Optional, Tuple
 
 import anthropic
+import pydantic
 
 from ..geocode import resolve_area, resolve_line, resolve_point, resolve_polygon, resolve_range_rings
 from ..spec import ChartSpec, LabeledPoint, LLMChartRequest, PointSetSpec
@@ -208,13 +209,29 @@ class ClaudeParser:
         self, text: str, uploaded_points: Optional[List[Tuple[str, float, float]]] = None
     ) -> ChartSpec:
         system = _SYSTEM_PROMPT + (_FILE_ADDENDUM if uploaded_points else "")
-        response = self._client.messages.parse(
-            model=_MODEL,
-            max_tokens=1024,
-            system=system,
-            messages=[{"role": "user", "content": text}],
-            output_format=LLMChartRequest,
-        )
+        try:
+            response = self._client.messages.parse(
+                model=_MODEL,
+                # Raised from the original 1024 -- that ceiling turned out to
+                # bite on any sufficiently rich single request (several
+                # overlays with real labels/coordinates in one message), not
+                # just long point lists (that case now has a real fix: the
+                # points-file upload path bypasses this entirely). 4096 gives
+                # roughly 4x the headroom, and a truncated response still
+                # fails cleanly below rather than crashing with a raw JSON
+                # parse error.
+                max_tokens=4096,
+                system=system,
+                messages=[{"role": "user", "content": text}],
+                output_format=LLMChartRequest,
+            )
+        except pydantic.ValidationError:
+            raise ParseError(
+                f"Could not parse request {text!r} -- it may be too long or too "
+                "detailed for one request. Try shortening it, splitting it into "
+                "multiple requests, or (for a long list of points) uploading a "
+                "points file instead of pasting them inline."
+            )
         parsed = response.parsed_output
         if parsed is None:
             raise ParseError(f"Could not parse request {text!r} into a chart spec.")

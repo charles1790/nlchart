@@ -331,7 +331,13 @@ def _build_polygon_symbol(polygon: PolygonSpec) -> QgsFillSymbol:
     color = QColor(_POINT_COLORS[polygon.color])
     fill_layer = QgsSimpleFillSymbolLayer()
     fill_layer.setColor(color)
-    fill_layer.setStrokeColor(QColor("black"))
+    # The outline follows the requested color too, not a hardcoded black --
+    # every other overlay type (points, lines, range rings) already uses
+    # the requested color directly with no such override. This mattered
+    # most for "unfilled" (outline-only, Qt.NoBrush below): with a fixed
+    # black stroke and no fill, the requested color was never visible on
+    # the chart at all, regardless of what was asked for.
+    fill_layer.setStrokeColor(color)
     fill_layer.setStrokeWidth(0.6)
 
     # "shaded" uses a real Qt.BrushStyle enum value, not createSimple()'s
